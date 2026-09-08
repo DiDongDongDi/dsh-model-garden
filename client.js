@@ -464,21 +464,19 @@ window.__ModuleLoader__.load({
 
     // ---- Plugin body ----
     function apply(ctx) {
-      const slots = ctx.get("slots");
-      if (slots === undefined) return;
-      slots.inject("conversation.input.model", () => slots.register(
+      // Wait for slot + directory + remote.session (Cordis caller inject).
+      // modelDirectories.directoryFor reads ctx.remote.session; without declaring
+      // remote/remote.session the seat crashes and abdicated back to native UI.
+      // Also prefer ctx.inject over one-shot ctx.get("slots") (silent no-op if early).
+      ctx.inject(["slots", "modelDirectories", "sessions", "remote", "remote.session"], (scope) => {
+        const models = scope.modelDirectories;
+        const sessions = scope.sessions;
+        scope.slots.inject("conversation.input.model", () => scope.slots.register(
         {
           name: "conversation.input.model",
           priority: -1,
           inject: (sessionId) => {
-            const sessions = ctx.get("sessions");
-            const available = sessions === undefined || sessions.subagentAddress === undefined
-              ? true
-              : sessions.subagentAddress(sessionId) === undefined;
-            const models = ctx.get("modelDirectories");
-            if (models === undefined) {
-              return { sessionId, available: false, directory: null, load: () => {}, select: () => Promise.resolve(false) };
-            }
+            const available = sessions.subagentAddress(sessionId) === undefined;
             const directory = models.directoryFor(sessionId);
             return {
               sessionId,
@@ -1400,9 +1398,10 @@ window.__ModuleLoader__.load({
           );
         }
       ));
+      });
     }
 
-    exports.inject = ["slots", "sessions", "modelDirectories"];
+    exports.inject = ["slots", "sessions", "modelDirectories", "remote", "remote.session"];
     exports.apply = apply;
     return module.exports;
   }

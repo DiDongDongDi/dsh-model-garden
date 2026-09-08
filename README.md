@@ -53,6 +53,11 @@ GET /model-garden/catalog
 
 The cost endpoint aggregates the real `usage` payloads of `assistant/message` events from the durable session log — no estimation. The cost-history endpoint additionally attributes each usage step to the model in effect: `assistant/message` events carry usage but not the model, so it tracks `request/context` (and `request/header`) events, which precede the request they describe with `{ provider, model }` — a single pass over the same in-memory events, no extra persistence. The catalog endpoint resolves `contextWindow` / `defaultMaxTokens` per model through the host `llm` service (`resolveModelInfo`), so local/self-hosted providers report their real limits.
 
+## Changelog (fork)
+
+### 0.6.4
+- Fix client seat crash on DeepSeek Harness `0.1.2-rc.1`: declare Cordis inject `remote` + `remote.session` (required by `modelDirectories.directoryFor`), and register the seat via `ctx.inject` instead of a one-shot `ctx.get("slots")`.
+
 ## Installation
 
 One command — the official plugin CLI installs the package **and** mounts it (the package carries a `dsh.bundle.patch` layer, so the CLI automatically appends it to the profile's bundle stack):
