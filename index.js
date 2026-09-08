@@ -17,6 +17,8 @@
  *
  * @module model-garden
  */
+import { createHmac, createHash } from 'node:crypto'
+
 export const name = 'dsh-model-garden'
 // Deliberately NO hard inject: profiles without a web stack (minimal or TUI
 // profiles) never provide `webServer`, and a hard inject would park this
@@ -254,6 +256,124 @@ async function getCatalog(llm, settings) {
   return catalogInflight
 }
 
+/* ------------------------------------------------------------------ *
+ * Tencent Cloud TokenHub "Token Plan" balance — host side.
+ *
+ * One same-origin route the picker polls for the monthly credit (积分)
+ * balance of the Tencent Cloud Token Plan subscription behind
+ * `api.lkeap.cloud.tencent.com/plan/v3`.
+ *
+ * Credentials come from the process environment ONLY — never from the
+ * browser. When TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY are
+ * missing the route answers { enabled: false } and the picker simply
+ * hides the badge; nothing else changes.
+ *
+ *   GET /model-garden/tokenplan
+ *   -> { enabled, plan?: { teamId, name, productType, status, stopReason,
+ *        unit, totalQuota, totalUsed, cycleQuota, cycleStartTime,
+ *        cycleEndTime, expireTime }, error? }
+ * ------------------------------------------------------------------ */
+const TOKENHUB_HOST = 'tokenhub.tencentcloudapi.com'
+const TOKENHUB_SERVICE = 'tokenhub'
+const TOKENHUB_VERSION = '2026-03-22'
+const TOKENHUB_REGION = 'ap-guangzhou'
+
+function sha256Hex(text) {
+  return createHash('sha256').update(text, 'utf8').digest('hex')
+}
+
+function hmac(key, text) {
+  return createHmac('sha256', key).update(text, 'utf8').digest('hex')
+}
+
+/** Sign a Tencent Cloud JSON POST (API 3.0 / TC3-HMAC-SHA256). */
+function tc3Headers(secretId, secretKey, action, payload) {
+  const timestamp = Math.floor(Date.now() / 1000)
+  const date = new Date(timestamp * 1000).toISOString().slice(0, 10)
+  const body = JSON.stringify(payload === undefined ? {} : payload)
+  const ct = 'application/json; charset=utf-8'
+
+  // Canonical headers are lower-cased. Host is part of the signature but is
+  // NOT sent as a header — undici/Node forbids a manual host header.
+  const canonicalHeaders =
+    'content-type:' + ct + '\n' +
+    'host:' + TOKENHUB_HOST + '\n' +
+    'x-tc-action:' + action.toLowerCase() + '\n'
+  const signedHeaders = 'content-type;host;x-tc-action'
+  const canonicalRequest =
+    'POST\n/\n\n' + canonicalHeaders + '\n' + signedHeaders + '\n' + sha256Hex(body)
+
+  const credentialScope = date + '/' + TOKENHUB_SERVICE + '/tc3_request'
+  const stringToSign =
+    'TC3-HMAC-SHA256\n' + timestamp + '\n' + credentialScope + '\n' + sha256Hex(canonicalRequest)
+
+  const kDate = hmac('TC3' + secretKey, date)
+  const kService = hmac(kDate, TOKENHUB_SERVICE)
+  const kSigning = hmac(kService, 'tc3_request')
+  const signature = hmac(kSigning, stringToSign)
+
+  return {
+    'content-type': ct,
+    'x-tc-action': action,
+    'x-tc-timestamp': String(timestamp),
+    'x-tc-version': TOKENHUB_VERSION,
+    'x-tc-region': TOKENHUB_REGION,
+    authorization: 'TC3-HMAC-SHA256 Credential=' + secretId + '/' + credentialScope +
+      ', SignedHeaders=' + signedHeaders + ', Signature=' + signature,
+  }
+}
+
+async function tc3Post(secretId, secretKey, action, payload) {
+  const resp = await fetch('https://' + TOKENHUB_HOST + '/', {
+    method: 'POST',
+    headers: tc3Headers(secretId, secretKey, action, payload),
+    body: JSON.stringify(payload === undefined ? {} : payload),
+  })
+  const text = await resp.text()
+  let json
+  try {
+    json = JSON.parse(text)
+  } catch {
+    throw new Error('tokenhub non-JSON response (' + resp.status + '): ' + text.slice(0, 200))
+  }
+  const err = json && json.Response && json.Response.Error
+  if (!resp.ok || err) {
+    throw new Error(err ? (err.Code + ': ' + err.Message) : ('HTTP ' + resp.status))
+  }
+  return json.Response || json
+}
+
+/** DescribeTokenPlanList + DescribeTokenPlan round trip → balance digest. */
+async function tokenPlanBalance(secretId, secretKey) {
+  const list = await tc3Post(secretId, secretKey, 'DescribeTokenPlanList', { Limit: 20 })
+  const set = Array.isArray(list.TokenPlanSet) ? list.TokenPlanSet : []
+  if (set.length === 0) return { enabled: true, reason: 'no-token-plan' }
+  const first = set[0]
+  const detail = await tc3Post(secretId, secretKey, 'DescribeTokenPlan', { TeamId: first.TeamId })
+  const pkg = detail.PackageInfo && typeof detail.PackageInfo === 'object' ? detail.PackageInfo : {}
+  const summary = detail.TokenSummary && typeof detail.TokenSummary === 'object' ? detail.TokenSummary : {}
+  const productType = typeof first.ProductType === 'string' ? first.ProductType : ''
+  // 通用/专业套餐按积分（credits）计，*auto/轻享套餐按 token 计。
+  const unit = /auto/i.test(productType) ? 'tokens' : 'credits'
+  return {
+    enabled: true,
+    plan: {
+      teamId: typeof first.TeamId === 'string' ? first.TeamId : undefined,
+      name: typeof first.Name === 'string' ? first.Name : undefined,
+      productType: productType || undefined,
+      status: typeof first.Status === 'string' ? first.Status : undefined,
+      stopReason: typeof first.StopReason === 'string' ? first.StopReason : undefined,
+      unit,
+      totalQuota: pkg.TotalQuota,
+      totalUsed: pkg.TotalUsed,
+      cycleQuota: pkg.CycleQuota,
+      cycleStartTime: summary.CycleStartTime,
+      cycleEndTime: summary.CycleEndTime,
+      expireTime: pkg.ExpireTime,
+    },
+  }
+}
+
 /**
  * Host apply: register the live-cost and catalog routes. Kept minimal and
  * side-effect free otherwise; disposable via ctx.effect.
@@ -322,6 +442,22 @@ export function apply(ctx) {
         }
       },
     }), 'model-garden: /model-garden/cost-history route')
+    ctx.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/model-garden/tokenplan',
+      handler: async (req, res) => {
+        const secretId = process.env.TENCENTCLOUD_SECRET_ID
+        const secretKey = process.env.TENCENTCLOUD_SECRET_KEY
+        if (!secretId || !secretKey) {
+          return writeJson(res, 200, { enabled: false, reason: 'credentials-not-configured' })
+        }
+        try {
+          writeJson(res, 200, await tokenPlanBalance(secretId, secretKey))
+        } catch (err) {
+          writeJson(res, 200, { enabled: true, error: String(err && err.message ? err.message : err) })
+        }
+      },
+    }), 'model-garden: /model-garden/tokenplan route')
   }
   mount()
   // `internal/service` fires whenever any service is provided; the listener

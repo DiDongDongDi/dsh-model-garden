@@ -24,6 +24,7 @@ A searchable, sortable **model picker** for the [DeepSeek Harness](https://githu
 - **🎚️ Reasoning effort picker** — models that support reasoning levels get a compact dropdown right next to the model name in the chat composer, styled and opening **exactly like the model picker** (same trigger pill, same floating menu surface, ✓ marks the active level, click outside / `Esc` / selecting closes it). Picking a model **always starts it at its strongest reasoning level**; the dropdown re-selects the current model with the chosen effort — no clutter inside the picker panel
 - **💸 Live per-task usage & cost** — real provider-reported token usage (from the session log) is **always shown** while the panel is open (`in / out / cache`). Each model's usage is multiplied by **its own** (reference) price — properly attributed even when a session switched models mid-way — the same math OpenCode uses (`usage × price`, not a heuristic)
 - **🧾 Session cost breakdown** — hover the `approx cost` figure for a popup **sized like the picker and parked parallel on its left (1 px gap)**: a **table-style breakdown** with per-model totals (steps, In/Out/Cache in their own columns, ≈ cost) and a **timestamped step table**. **Clickable column headers** work like Excel / the main list (asc → desc → off, ▲/▼ indicator) on both tables; **copy** the summary or **export the (sorted) step list as CSV** (Excel-ready). The invisible hover target spans the cost row all the way to its left edge. Attribution of each step to its model comes straight from the session log (`request/context` events); nothing extra is stored
+- **📅 Tencent Cloud Token Plan balance badge** — while the picker is open, the cost row shows a **`本月积分剩余`** badge fed by the host's `/model-garden/tokenplan` route: quota − used from the TokenHub **主额度包** (`DescribeTokenPlan`), refreshed every 5 minutes and on open. The host signs Tencent Cloud API 3.0 (TC3) requests with **`TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY` from its own process env** — the browser never touches a credential. Without those env vars, or on any error, the badge simply stays hidden
 - **🖱️ Detail tooltip** that opens *beside* the panel (never covers the list): description, price, context window, max output, reasoning efforts
 - **🎨 Native look** — built entirely on the harness design tokens (`--dsw-alias-*`); the picker panel, the effort menu, the detail tooltip and the cost popup all share the same surface color and geometry, matching light & dark theme automatically
 
@@ -49,11 +50,21 @@ GET /model-garden/cost-history?session=<sessionId>&limit=<n>
 
 GET /model-garden/catalog
   → { "provider::model": { local, context?, maxOutput? } }   (cached 10 min)
+
+GET /model-garden/tokenplan
+  → { enabled, plan?: { teamId, name, productType, status, stopReason,
+      unit, totalQuota, totalUsed, cycleQuota,
+      cycleStartTime, cycleEndTime, expireTime }, error? }
+  Returns { enabled: false } when TENCENTCLOUD_SECRET_ID/KEY are absent;
+  silently ignores errors so the picker never breaks.
 ```
 
 The cost endpoint aggregates the real `usage` payloads of `assistant/message` events from the durable session log — no estimation. The cost-history endpoint additionally attributes each usage step to the model in effect: `assistant/message` events carry usage but not the model, so it tracks `request/context` (and `request/header`) events, which precede the request they describe with `{ provider, model }` — a single pass over the same in-memory events, no extra persistence. The catalog endpoint resolves `contextWindow` / `defaultMaxTokens` per model through the host `llm` service (`resolveModelInfo`), so local/self-hosted providers report their real limits.
 
 ## Changelog (fork)
+
+### 0.6.5 (fork)
+- **New:** Tencent Cloud Token Plan 月度积分余量徽标。Host 新增 `GET /model-garden/tokenplan`：用进程环境变量 `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY` 做 TC3 签名，调 TokenHub `DescribeTokenPlanList` → `DescribeTokenPlan`，返回主额度包 quota/used；client 在成本行右侧渲染「积分 剩余 x/y」徽标，每 5 分钟轮询。无凭据/出错时静默隐藏，不影响原功能。
 
 ### 0.6.4
 - Fix client seat crash on DeepSeek Harness `0.1.2-rc.1`: declare Cordis inject `remote` + `remote.session` (required by `modelDirectories.directoryFor`), and register the seat via `ctx.inject` instead of a one-shot `ctx.get("slots")`.
@@ -64,6 +75,12 @@ One command — the official plugin CLI installs the package **and** mounts it (
 
 ```sh
 dsh plugin --profile <profile> add dsh-model-garden
+```
+
+Installing your **local fork** (this repo) instead of the published package:
+
+```sh
+dsh plugin --profile <profile> add /Users/kodyqywang/dsh-model-garden
 ```
 
 Then restart the DSH server and hard-refresh the browser (`Cmd/Ctrl+Shift+R`).
@@ -85,7 +102,11 @@ If you manage the profile with plain npm: add the dependency, list `dsh-model-ga
 
 ## Configuration
 
-No configuration is required. Several tweakable constants live at the top of the respective file:
+No configuration is required for the picker itself. The Token Plan balance badge additionally needs two env vars on the **harness host** process:
+
+- `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY` — a [Tencent Cloud API key](https://console.cloud.tencent.com/cam/capi) (NOT the lkeap `sk-*` key). Used only by the host to sign TokenHub `DescribeTokenPlanList`/`DescribeTokenPlan` calls; the browser never receives them. Missing or wrong credentials just hide the badge.
+
+Tweakable constants live at the top of the respective file:
 
 - **Auto model-list update interval** — `MODEL_LIST_REFRESH_MS` in `client.js` (default 5 min) controls how often the provider/model directory is reloaded while the picker is mounted.
 - **Hidden provider routes** — `HIDDEN_PROVIDER_PREFIXES` in `client.js` (and `SKIP_PREFIXES` in `index.js`). Some plugins mirror providers as internal routes (e.g. a vision toolkit duplicating every provider as `vision-toolkit-<id>`); such prefixes are excluded from the picker and the catalog.

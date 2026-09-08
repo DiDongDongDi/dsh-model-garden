@@ -123,6 +123,7 @@ window.__ModuleLoader__.load({
         ".mg-error { margin: 4px 8px 0; padding: 7px 8px; border-radius: 8px; background: var(--dsw-alias-interactive-bg-hover-danger); color: var(--dsw-alias-state-error-primary); font-size: 12px; line-height: 18px; }",
         ".mg-cost { padding: 6px 10px; border-top: 1px solid var(--dsw-alias-border-l2); font-size: 12px; line-height: 18px; color: var(--dsw-alias-state-business-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
         ".mg-cost-detail { color: var(--dsw-alias-label-tertiary); }",
+        ".mg-plan { display: inline-block; margin-left: 8px; padding: 0 7px; border-radius: 8px; background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-state-business-primary); font-weight: 600; }",
         // The reasoning-effort choice lives in the chat composer next to the
         // model name (mg-effort-outer/menu) — no UI for it inside the panel.
         // The cost figure sits inside an INVISIBLE padded hover target that
@@ -664,6 +665,10 @@ window.__ModuleLoader__.load({
           // Column sorting (click header): asc → desc → off, like the panel.
           const [stepSort, setStepSort] = React.useState(null); // {key, dir} | null
           const [modelSort, setModelSort] = React.useState(null);
+          // Tencent Cloud Token Plan balance payload ({ enabled, plan? })
+          // served by the host /model-garden/tokenplan route; null = not
+          // fetched yet, keeps the badge hidden.
+          const [plan, setPlan] = React.useState(null);
           const sessionId = props.sessionId;
           // The breakdown popup is interactive (scrollable, copy button), so
           // the pointer must be able to travel from the cost line into it.
@@ -718,6 +723,26 @@ window.__ModuleLoader__.load({
             const timer = globalThis.setInterval(tick, 1500);
             return () => { alive = false; globalThis.clearInterval(timer); };
           }, [open, sessionId]);
+          // ---- Tencent Cloud Token Plan 月度积分余量徽标 ----
+          // While the picker is open, poll the host's /model-garden/tokenplan
+          // endpoint every 5 minutes. The host reads TENCENTCLOUD_SECRET_ID /
+          // TENCENTCLOUD_SECRET_KEY from its own process env — the browser
+          // never touches a credential. No credentials / error => the badge
+          // simply stays hidden; nothing else changes.
+          React.useEffect(() => {
+            if (!open) return;
+            let alive = true;
+            const tick = () => {
+              if (globalThis.document && globalThis.document.hidden) return;
+              globalThis.fetch("/model-garden/tokenplan")
+                .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
+                .then(function (d) { if (!alive) return; setPlan(d); })
+                .catch(function () { if (!alive) return; setPlan({ enabled: false, reason: "unreachable" }); });
+            };
+            tick();
+            const timer = globalThis.setInterval(tick, 5 * 60 * 1000);
+            return () => { alive = false; globalThis.clearInterval(timer); };
+          }, [open]);
           const costHoverProps = {
             onMouseEnter: (e) => {
               cancelHistClose();
@@ -971,6 +996,29 @@ window.__ModuleLoader__.load({
                 const label = current === null
                   ? "no model selected"
                   : (current.model || current.provider || "model");
+                // Token Plan 月度余量徽标：quota/used 均来自腾讯云主额度包，
+                // remaining = quota - used；不可用或未配置凭据时为 null（不显示）。
+                let planBadge = null;
+                const plPlan = plan && plan.plan;
+                if (plan && plan.enabled && !plan.error && plPlan) {
+                  const q = Number(plPlan.totalQuota);
+                  const u = Number(plPlan.totalUsed);
+                  const remain = Number.isFinite(q) && Number.isFinite(u)
+                    ? Math.max(0, Math.round(q - u))
+                    : null;
+                  if (remain !== null) {
+                    const unitLabel = plPlan.unit === "tokens" ? "tokens" : "积分";
+                    const until = plPlan.cycleEndTime ? String(plPlan.cycleEndTime).slice(0, 10) : "";
+                    const name = typeof plPlan.name === "string" ? plPlan.name : "";
+                    planBadge = React.createElement("span",
+                      { className: "mg-plan",
+                        title: ("Token Plan · " + unitLabel + "本月剩余 " + remain.toLocaleString() +
+                          (Number.isFinite(q) ? " / " + q.toLocaleString() : "") +
+                          (until ? " · 本期至 " + until : "") + (name ? " · " + name : "")) },
+                      unitLabel + " 剩余 " + remain.toLocaleString() +
+                        (Number.isFinite(q) ? " / " + q.toLocaleString() : ""));
+                  }
+                }
                 // Token usage is ALWAYS shown once the session has traffic;
                 // the cost figure depends on a (reference) price being known.
                 const detail = formatTokens(cc.inputTokens) + " in / " + formatTokens(cc.outputTokens) + " out" +
@@ -988,7 +1036,8 @@ window.__ModuleLoader__.load({
                   return React.createElement("div", { className: "mg-cost" },
                     React.createElement("span", null, note,
                       React.createElement("span", { className: "mg-cost-detail" }, " · " + detail + " · " + label)
-                    )
+                    ),
+                    planBadge
                   );
                 }
                 const line = "approx cost: " + formatMoney(cc.total);
@@ -1000,7 +1049,8 @@ window.__ModuleLoader__.load({
                       Object.assign({ className: "mg-costbtn", title: "Hover: session cost breakdown" }, costHoverProps),
                       line),
                     React.createElement("span", { className: "mg-cost-detail" }, " · " + detail + " · " + label)
-                  )
+                  ),
+                  planBadge
                 );
               })(),
               filtered.length === 0 && !(status === "loading") && React.createElement("div", { className: "mg-empty" },
